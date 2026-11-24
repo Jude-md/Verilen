@@ -1,5 +1,6 @@
 import crypto from "crypto";
 import fs from "fs";
+import os from "os";
 import path from "path";
 import sharp from "sharp";
 import type { MatchType, VisualSignaturePayload } from "@/db/schema";
@@ -369,29 +370,79 @@ export async function extractVisualSignature(
  * Normalizes and persists an uploaded query or profile image inside public/uploads/
  * returning the web path served via /api/media/[filename] so dynamic production renders never fail.
  */
+export const TMP_UPLOAD_DIR = path.join(os.tmpdir(), "verilens-uploads");
+
+/** Directories that may hold normalized uploads (public/ locally, /tmp on serverless). */
+export function getUploadDirs(): string[] {
+  return [UPLOAD_DIR, TMP_UPLOAD_DIR];
+}
+
+/**
+ * Normalizes and persists an uploaded image.
+ *
+ * Serverless platforms (Vercel) ship a read-only filesystem, so this falls back to
+ * the writable OS temp dir and finally to an inline data URL — the scan always works.
+ */
 export async function saveNormalizedImage(
   buffer: Buffer,
   prefix: string,
   maxDim = 960
-): Promise<{ filename: string; publicUrl: string; width: number; height: number; size: number }> {
-  ensureUploadDir();
+): Promise<{
+  filename: string;
+  publicUrl: string;
+  width: number;
+  height: number;
+  size: number;
+}> {
   const id = `${prefix}-${Date.now()}-${crypto.randomBytes(5).toString("hex")}.jpg`;
-  const fullPath = path.join(UPLOAD_DIR, id);
 
-  const output = await sharp(buffer, { failOn: "truncated" })
-    .rotate()
-    .resize(maxDim, maxDim, { fit: "inside", withoutEnlargement: true })
-    .jpeg({ quality: 88, mozjpeg: true })
-    .toBuffer({ resolveWithObject: true });
+  const encode = async (size: number, quality: number) =>
+    sharp(buffer, { failOn: "truncated" })
+      .rotate()
+      .resize(size, size, { fit: "inside", withoutEnlargement: true })
+      .jpeg({ quality, mozjpeg: true })
+      .toBuffer({ resolveWithObject: true });
 
-  await fs.promises.writeFile(fullPath, output.data);
+  const output = await encode(maxDim, 88);
 
+  // 1. Preferred: public/uploads (works locally & on any writable host)
+  try {
+    ensureUploadDir();
+    await fs.promises.writeFile(path.join(UPLOAD_DIR, id), output.data);
+    return {
+      filename: id,
+      publicUrl: `/api/media/${id}`,
+      width: output.info.width,
+      height: output.info.height,
+      size: output.info.size,
+    };
+  } catch {
+    // Read-only filesystem (Vercel) — continue to temp dir
+  }
+
+  // 2. Serverless-safe: OS temp directory served through /api/media
+  try {
+    await fs.promises.mkdir(TMP_UPLOAD_DIR, { recursive: true });
+    await fs.promises.writeFile(path.join(TMP_UPLOAD_DIR, id), output.data);
+    return {
+      filename: id,
+      publicUrl: `/api/media/${id}`,
+      width: output.info.width,
+      height: output.info.height,
+      size: output.info.size,
+    };
+  } catch {
+    // Last resort below
+  }
+
+  // 3. Last resort: inline data URL (smaller re-encode so responses stay light)
+  const inline = await encode(640, 74);
   return {
     filename: id,
-    publicUrl: `/api/media/${id}`,
-    width: output.info.width,
-    height: output.info.height,
-    size: output.info.size,
+    publicUrl: `data:image/jpeg;base64,${inline.data.toString("base64")}`,
+    width: inline.info.width,
+    height: inline.info.height,
+    size: inline.info.size,
   };
 }
 

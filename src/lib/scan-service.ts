@@ -1,6 +1,6 @@
 import crypto from "crypto";
 import { desc, eq, inArray } from "drizzle-orm";
-import { db } from "@/db";
+import { db, isDatabaseConfigured } from "@/db";
 import {
   publicProfiles,
   scanMatches,
@@ -153,7 +153,18 @@ export async function executeImageScan(options: {
     storedBytes = saved.size;
   }
 
-  const allProfiles = await db.select().from(publicProfiles);
+  // Indexed catalog is optional: without a database we still run live web search.
+  let allProfiles: Array<typeof publicProfiles.$inferSelect> = [];
+  if (isDatabaseConfigured()) {
+    try {
+      allProfiles = await db.select().from(publicProfiles);
+    } catch (err) {
+      console.warn(
+        "[verilens] Indexed catalog unavailable:",
+        err instanceof Error ? err.message : err
+      );
+    }
+  }
   const distinctPlatforms = new Set(allProfiles.map((p) => p.platform));
 
   // Group linked handles by identityKey so users can uncover every cross-platform handle
@@ -230,9 +241,14 @@ export async function executeImageScan(options: {
     : localBest;
   const engineMode = isLiveScan ? "live_web" : "indexed";
 
-  const [createdScan] = await db
-    .insert(scans)
-    .values({
+  let createdScan: typeof scans.$inferSelect | null = null;
+  let insertedMatches: Array<typeof scanMatches.$inferSelect> = [];
+
+  if (isDatabaseConfigured()) {
+    try {
+      const [savedScan] = await db
+        .insert(scans)
+        .values({
       id: scanId,
       sourceType: options.sourceType,
       queryLabel: options.queryLabel.slice(0, 120),
@@ -250,13 +266,13 @@ export async function executeImageScan(options: {
       durationMs,
       engineMode,
       liveResults: liveMatches,
-      liveStatus,
-    })
-    .returning();
+        liveStatus,
+      })
+        .returning();
+      createdScan = savedScan ?? null;
 
-  const insertedMatches =
-    selected.length > 0
-      ? await db
+      if (selected.length > 0) {
+        insertedMatches = await db
           .insert(scanMatches)
           .values(
             selected.map((item, idx) => ({
@@ -273,18 +289,29 @@ export async function executeImageScan(options: {
               rank: idx + 1,
             }))
           )
-          .returning()
-      : [];
+          .returning();
+      }
+    } catch (err) {
+      console.warn(
+        "[verilens] Scan persistence skipped:",
+        err instanceof Error ? err.message : err
+      );
+      createdScan = null;
+      insertedMatches = [];
+    }
+  }
 
   const platformCounts = emptyPlatformCounts();
-  const matches: ScanMatchDTO[] = insertedMatches.map((row, idx) => {
-    const profile = selected[idx].profile;
+  const rowByProfileId = new Map(insertedMatches.map((row) => [row.profileId, row]));
+  const matches: ScanMatchDTO[] = selected.map((item, idx) => {
+    const profile = item.profile;
+    const row = rowByProfileId.get(profile.id);
     platformCounts[profile.platform] = (platformCounts[profile.platform] ?? 0) + 1;
     const siblingAccounts = (byIdentity.get(profile.identityKey) ?? []).filter(
       (acct) => acct.id !== profile.id
     );
     return {
-      id: row.id,
+      id: row?.id ?? -(idx + 1),
       profileId: profile.id,
       identityKey: profile.identityKey,
       platform: profile.platform,
@@ -297,36 +324,38 @@ export async function executeImageScan(options: {
       followersCount: profile.followersCount,
       verified: profile.verified,
       isUserAdded: profile.isUserAdded,
-      similarityScore: row.similarityScore,
-      structuralScore: row.structuralScore,
-      facialScore: row.facialScore,
-      toneScore: row.toneScore,
-      matchType: row.matchType,
-      matchReason: row.matchReason,
-      isSaved: row.isSaved,
-      isFlagged: row.isFlagged,
-      rank: row.rank,
+      similarityScore: row?.similarityScore ?? item.breakdown.similarityScore,
+      structuralScore: row?.structuralScore ?? item.breakdown.structuralScore,
+      facialScore: row?.facialScore ?? item.breakdown.facialScore,
+      toneScore: row?.toneScore ?? item.breakdown.toneScore,
+      matchType: row?.matchType ?? item.breakdown.matchType,
+      matchReason: row?.matchReason ?? item.breakdown.matchReason,
+      isSaved: row?.isSaved ?? false,
+      isFlagged: row?.isFlagged ?? false,
+      rank: row?.rank ?? idx + 1,
       linkedAccounts: siblingAccounts,
     };
   });
 
   return {
-    id: createdScan.id,
-    sourceType: createdScan.sourceType,
-    queryLabel: createdScan.queryLabel,
-    imagePath: createdScan.imagePath,
-    imageWidth: createdScan.imageWidth,
-    imageHeight: createdScan.imageHeight,
-    fileSizeBytes: createdScan.fileSizeBytes,
-    dhash: createdScan.dhash,
-    dominantColors: createdScan.dominantColors,
-    platformsScanned: createdScan.platformsScanned,
-    profilesScanned: createdScan.profilesScanned,
-    matchCount: createdScan.matchCount,
-    topSimilarity: createdScan.topSimilarity,
-    durationMs: createdScan.durationMs,
-    engineMode: createdScan.engineMode,
-    createdAt: createdScan.createdAt.toISOString(),
+    id: createdScan?.id ?? scanId,
+    sourceType: createdScan?.sourceType ?? options.sourceType,
+    queryLabel: createdScan?.queryLabel ?? options.queryLabel.slice(0, 120),
+    imagePath: createdScan?.imagePath ?? imagePath,
+    imageWidth: createdScan?.imageWidth ?? storedWidth,
+    imageHeight: createdScan?.imageHeight ?? storedHeight,
+    fileSizeBytes: createdScan?.fileSizeBytes ?? storedBytes,
+    dhash: createdScan?.dhash ?? extracted.dhash,
+    dominantColors:
+      createdScan?.dominantColors ?? extracted.visualVector.palette,
+    platformsScanned:
+      createdScan?.platformsScanned ?? (isLiveScan ? 17 : 6),
+    profilesScanned: createdScan?.profilesScanned ?? allProfiles.length,
+    matchCount: createdScan?.matchCount ?? effectiveMatchCount,
+    topSimilarity: createdScan?.topSimilarity ?? topSimilarity,
+    durationMs: createdScan?.durationMs ?? durationMs,
+    engineMode: createdScan?.engineMode ?? engineMode,
+    createdAt: (createdScan?.createdAt ?? new Date()).toISOString(),
     platformCounts,
     matches,
     liveMatches,
@@ -338,6 +367,7 @@ export async function executeImageScan(options: {
  * Loads a persisted scan and all ranked public social profile matches by ID.
  */
 export async function getScanById(scanId: string): Promise<ScanResultDTO | null> {
+  if (!isDatabaseConfigured()) return null;
   await ensureProfilesSeeded();
   const [scan] = await db.select().from(scans).where(eq(scans.id, scanId));
   if (!scan) return null;
@@ -437,6 +467,7 @@ export async function getScanById(scanId: string): Promise<ScanResultDTO | null>
  * Lists recent persisted image scans with top-matched handle preview.
  */
 export async function listRecentScans(limit = 25): Promise<ScanSummaryDTO[]> {
+  if (!isDatabaseConfigured()) return [];
   await ensureProfilesSeeded();
   const rows = await db
     .select()

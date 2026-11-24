@@ -1,7 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { count } from "drizzle-orm";
-import { db } from "@/db";
+import { db, isDatabaseConfigured } from "@/db";
 import { publicProfiles, type SocialPlatform } from "@/db/schema";
 import { extractVisualSignature, type ExtractedImageSignature } from "@/lib/vision";
 
@@ -449,6 +449,7 @@ const SEED_PROFILES: SeedProfileSpec[] = [
 const globalForSeed = globalThis as typeof globalThis & {
   __veriLensSeedPromise?: Promise<void>;
   __veriLensSeeded?: boolean;
+  __veriLensSeedUnavailable?: boolean;
 };
 
 async function runSeed(): Promise<void> {
@@ -466,9 +467,14 @@ async function runSeed(): Promise<void> {
     let sig = signatureCache.get(spec.avatarFile);
     if (!sig) {
       const filePath = path.join(profilesDir, spec.avatarFile);
-      const buffer = await fs.promises.readFile(filePath);
-      sig = await extractVisualSignature(buffer);
-      signatureCache.set(spec.avatarFile, sig);
+      try {
+        const buffer = await fs.promises.readFile(filePath);
+        sig = await extractVisualSignature(buffer);
+        signatureCache.set(spec.avatarFile, sig);
+      } catch {
+        // Avatar file unavailable in this runtime (serverless bundle) — skip this entry
+        continue;
+      }
     }
 
     rows.push({
@@ -490,21 +496,38 @@ async function runSeed(): Promise<void> {
     });
   }
 
-  await db
-    .insert(publicProfiles)
-    .values(rows)
-    .onConflictDoNothing();
+  if (rows.length === 0) return;
 
-  globalForSeed.__veriLensSeeded = true;
+  await db.insert(publicProfiles).values(rows).onConflictDoNothing();
 }
 
+/**
+ * Idempotently seeds the demo public-profile catalog.
+ * Never throws: when DATABASE_URL is absent (e.g. a Vercel preview without a
+ * database) or the avatar files are unavailable, the app keeps running and the
+ * live open-web search still works.
+ */
 export async function ensureProfilesSeeded(): Promise<void> {
   if (globalForSeed.__veriLensSeeded) return;
+  if (!isDatabaseConfigured()) {
+    globalForSeed.__veriLensSeedUnavailable = true;
+    return;
+  }
   if (!globalForSeed.__veriLensSeedPromise) {
-    globalForSeed.__veriLensSeedPromise = runSeed().catch((err) => {
-      globalForSeed.__veriLensSeedPromise = undefined;
-      throw err;
-    });
+    globalForSeed.__veriLensSeedPromise = runSeed()
+      .then(() => {
+        globalForSeed.__veriLensSeeded = true;
+      })
+      .catch((err) => {
+        globalForSeed.__veriLensSeedUnavailable = true;
+        console.warn(
+          "[verilens] Profile catalog seeding skipped:",
+          err instanceof Error ? err.message : err
+        );
+      })
+      .finally(() => {
+        globalForSeed.__veriLensSeedPromise = undefined;
+      });
   }
   await globalForSeed.__veriLensSeedPromise;
 }

@@ -27,6 +27,7 @@ interface VeriLensAppProps {
   initialRecentScans: ScanSummaryDTO[];
   initialScan: ScanResultDTO | null;
   initialSettings: ProviderSettingsDTO;
+  databaseReady?: boolean;
 }
 
 const MIN_SCAN_ANIMATION_MS = 1050;
@@ -36,6 +37,7 @@ export function VeriLensApp({
   initialRecentScans,
   initialScan,
   initialSettings,
+  databaseReady = true,
 }: VeriLensAppProps) {
   const [indexedCount, setIndexedCount] = useState(initialIndexedCount);
   const [recentScans, setRecentScans] =
@@ -519,6 +521,30 @@ export function VeriLensApp({
           </nav>
         </div>
       </header>
+
+      {/* Deployment setup notice — app stays fully usable without persistence */}
+      {!databaseReady && (
+        <div className="border-b border-amber-200/80 bg-amber-50/80">
+          <div className="mx-auto flex max-w-[1240px] flex-wrap items-center justify-between gap-2 px-4 py-2.5 text-[12.5px] sm:px-6 lg:px-8">
+            <p className="text-amber-800">
+              <span className="font-medium">Live search is active.</span>{" "}
+              Scan history, bookmarks and the demo catalog need a database — add{" "}
+              <code className="rounded bg-amber-100/80 px-1 py-0.5 font-mono text-[11.5px]">
+                DATABASE_URL
+              </code>{" "}
+              in your host&apos;s environment variables, then redeploy.
+            </p>
+            <a
+              href="/api/health"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="font-medium text-amber-900 underline decoration-amber-400 underline-offset-2 hover:text-amber-950"
+            >
+              View status
+            </a>
+          </div>
+        </div>
+      )}
 
       {/* Main Focused Application Stage */}
       <main>

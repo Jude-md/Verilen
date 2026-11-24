@@ -11,9 +11,13 @@ import type { ProviderSettingsDTO } from "@/lib/live-types";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+const READ_ONLY_NOTE =
+  "Saved for this running instance. This host has a read-only filesystem, so add the same value as an environment variable in your host dashboard (e.g. Vercel → Settings → Environment Variables) to make it permanent.";
+
 function buildSettingsPayload(): ProviderSettingsDTO & {
   configured: boolean;
   maskedKey: string | null;
+  envPersistence: "dotenv" | "memory";
 } {
   const settings = getProviderSettings();
   return {
@@ -21,6 +25,7 @@ function buildSettingsPayload(): ProviderSettingsDTO & {
     // Always active automatically via zero-key live engine; individual flags show optional boosts
     configured: settings.serpapi.configured,
     maskedKey: settings.serpapi.maskedKey,
+    envPersistence: process.env.VERCEL ? "memory" : "dotenv",
   };
 }
 
@@ -83,21 +88,24 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: result.message }, { status: 400 });
       }
 
+      let persisted = true;
       if (apiKey) {
-        writeSecret("APIFY_API_TOKEN", apiKey);
+        persisted = writeSecret("APIFY_API_TOKEN", apiKey) && persisted;
       }
       if (serverUrl) {
-        writeSecret(
-          "APIFY_PROFILE_FINDER_SERVER_URL",
-          serverUrl.replace(/\/+$/, "")
-        );
+        persisted =
+          writeSecret(
+            "APIFY_PROFILE_FINDER_SERVER_URL",
+            serverUrl.replace(/\/+$/, "")
+          ) && persisted;
       } else if (body && "serverUrl" in body && body.serverUrl === "") {
         writeSecret("APIFY_PROFILE_FINDER_SERVER_URL", null);
       }
 
       return NextResponse.json({
         ...buildSettingsPayload(),
-        message: result.message,
+        message: persisted ? result.message : `${result.message} ${READ_ONLY_NOTE}`,
+        persisted,
       });
     }
 
@@ -139,11 +147,14 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: verification.message }, { status: 400 });
     }
 
-    writeSecret("SERPAPI_API_KEY", apiKey);
+    const persisted = writeSecret("SERPAPI_API_KEY", apiKey);
     return NextResponse.json({
       ...buildSettingsPayload(),
       maskedKey: maskKey(apiKey),
-      message: verification.message,
+      message: persisted
+        ? verification.message
+        : `${verification.message} ${READ_ONLY_NOTE}`,
+      persisted,
     });
   } catch (err) {
     const message =

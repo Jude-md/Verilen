@@ -90,8 +90,12 @@ export function readSecretWithSource(
   return { value: undefined, source: null, envName: null };
 }
 
-/** Writes or removes a secret inside `.env` (mode 0600) and updates `process.env` live. */
-export function writeSecret(name: string, value: string | null): void {
+/**
+ * Writes or removes a secret inside `.env` (mode 0600) and updates `process.env`.
+ * Returns false on read-only serverless filesystems (e.g. Vercel) so callers can
+ * instruct the user to set a real environment variable instead.
+ */
+export function writeSecret(name: string, value: string | null): boolean {
   let content = "";
   try {
     content = fs.readFileSync(ENV_PATH, "utf8");
@@ -135,14 +139,24 @@ export function writeSecret(name: string, value: string | null): void {
   }
 
   const finalBody = out.length > 0 ? `${out.join("\n")}\n` : "";
-  fs.writeFileSync(ENV_PATH, finalBody, { mode: 0o600 });
+  let persisted = false;
+  try {
+    fs.writeFileSync(ENV_PATH, finalBody, { mode: 0o600 });
+    persisted = true;
+  } catch {
+    // Read-only filesystem (Vercel/serverless) — the in-memory value still applies
+    // for this instance, but it will not survive a redeploy.
+    persisted = false;
+  }
   globalForEnv.__veriLensEnvCache = undefined;
 
+  // Keep the effective value available to this process either way.
   if (value !== null) {
     process.env[name] = value;
   } else {
     delete process.env[name];
   }
+  return persisted;
 }
 
 export function maskKey(key: string): string {
